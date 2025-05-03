@@ -191,59 +191,51 @@ func (n *Node) resetElectionTimer() {
 // ------------------------------------------------------------
 
 func (n *Node) startElection() {
-	// step up to candidate & bump term
-	n.mu.Lock()
-	n.state = Candidate
+    n.mu.Lock()
+    n.state = Candidate
+    n.currentTerm++
+    n.store.SetTerm(n.currentTerm)
+    n.votedFor = n.id
+    n.store.SetVotedFor(n.id)
+    term := n.currentTerm
+    lastIdx, lastTerm := n.log.LastIndexTerm()
+    n.resetElectionTimer()
+    peerAddrs := make(map[string]string, len(n.peers))
+    for id, addr := range n.peers {
+        if id != n.id {
+            peerAddrs[id] = addr
+        }
+    }
+    n.mu.Unlock()
 
-	n.currentTerm++
-	n.store.SetTerm(n.currentTerm)
+    var votes int32 = 1 // self-vote
+    var wg sync.WaitGroup
 
-	n.votedFor = n.id
-	n.store.SetVotedFor(n.id)
-
-	term := n.currentTerm
-	lastIdx, lastTerm := n.log.LastIndexTerm()
-	n.resetElectionTimer()
-
-	// copy peers map so we can iterate after releasing the lock
-	peerAddrs := make(map[string]string, len(n.peers))
-	for id, addr := range n.peers {
-		if id != n.id {
-			peerAddrs[id] = addr
-		}
-	}
-	n.mu.Unlock()
-
-	var votes int32 = 1 // self-vote
-	var wg sync.WaitGroup
-
-	for pid, paddr := range peerAddrs {
-		wg.Add(1)
-		go func(id, addr string) {
-			defer wg.Done()
-			args := RequestVoteArgs{Term: term, CandidateID: n.id, LastLogIndex: lastIdx, LastLogTerm: lastTerm}
-			var reply RequestVoteReply
-			if err := n.trans.Call(addr, transport.RPCRequestVote, &args, &reply); err != nil {
-				return
-			}
-			if reply.Term > term {
-				n.mu.Lock()
-				n.becomeFollower(reply.Term)
-				n.mu.Unlock()
-				return
-			}
-			if reply.VoteGranted && reply.Term == term {
-				if atomic.AddInt32(&votes, 1) > int32(len(n.peers)/2) {
-					n.mu.Lock()
-					if n.state == Candidate && n.currentTerm == term {
-						n.becomeLeader()
-					}
-					n.mu.Unlock()
-				}
-			}
-		}(pid, paddr)
-	}
-	wg.Wait()
+    for pid, paddr := range peerAddrs {
+        wg.Add(1)
+        go func(id, addr string) {
+            defer wg.Done()
+            args := RequestVoteArgs{Term: term, CandidateID: n.id, LastLogIndex: lastIdx, LastLogTerm: lastTerm}
+            var reply RequestVoteReply
+            if err := n.trans.Call(addr, transport.RPCRequestVote, &args, &reply); err != nil {
+                return
+            }
+            n.mu.Lock()
+            defer n.mu.Unlock()
+            if reply.Term > n.currentTerm {
+                n.becomeFollower(reply.Term)
+                return
+            }
+            if reply.VoteGranted && reply.Term == term {
+                if atomic.AddInt32(&votes, 1) > int32(len(n.peers)/2) {
+                    if n.state == Candidate && n.currentTerm == term {
+                        n.becomeLeader()
+                    }
+                }
+            }
+        }(pid, paddr)
+    }
+    wg.Wait()
 }
 
 // ------------------------------------------------------------
@@ -327,46 +319,42 @@ func (n *Node) broadcastAppendEntries() {
 }
 
 func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+    n.mu.Lock()
+    defer n.mu.Unlock()
 
-	if reply.Term > n.currentTerm {
-		n.becomeFollower(reply.Term)
-		return
-	}
-	if !reply.Success {
-		if n.nextIndex[peerID] > 1 {
-			n.nextIndex[peerID]--
-		}
-		return
-	}
+    if reply.Term > n.currentTerm {
+        n.becomeFollower(reply.Term)
+        return
+    }
+    if !reply.Success {
+        if n.nextIndex[peerID] > 1 {
+            n.nextIndex[peerID]--
+        }
+        return
+    }
 
-	// --- success path --------------------------------------------------
-	n.nextIndex[peerID] = n.log.LastIndex() + 1
-	n.matchIndex[peerID] = n.log.LastIndex()
+    n.nextIndex[peerID] = n.log.LastIndex() + 1
+    n.matchIndex[peerID] = n.log.LastIndex()
 
-	advanced := false
-	for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
-		replicated := 1 // self
-		for id := range n.peers {
-			if id != n.id && n.matchIndex[id] >= i {
-				replicated++
-			}
-		}
-		if replicated > len(n.peers)/2 {
-			n.commitIndex = i
-			advanced = true
-		}
-	}
+    advanced := false
+    for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
+        replicated := 1 // self
+        for id := range n.peers {
+            if id != n.id && n.matchIndex[id] >= i {
+                replicated++
+            }
+        }
+        if replicated > len(n.peers)/2 {
+            n.commitIndex = i
+            advanced = true
+        }
+    }
 
-	// tell followers the new commitIndex
-	if advanced {
-		go n.broadcastAppendEntries()
-		n.maybePrune()
-	}
-
-	// apply to local state machine
-	n.applyCommitted()
+    if advanced {
+        go n.broadcastAppendEntries()
+        n.maybePrune()
+    }
+    n.applyCommitted()
 }
 
 func (n *Node) onRequestVote(args *RequestVoteArgs) RequestVoteReply {

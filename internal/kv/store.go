@@ -40,16 +40,17 @@ func (s *Store) Get(key string) string {
 
 func (s *Store) Apply(cmd any) any {
 	switch c := cmd.(type) {
-
 	case SetCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Put([]byte(c.Key), []byte(c.Value))
 		})
+		s.lru.add(c.Key, c.Value)
 
 	case DelCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Delete([]byte(c.Key))
 		})
+		s.lru.remove(c.Key)
 
 	case GetCmd:
 		return s.Get(c.Key)

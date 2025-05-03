@@ -130,9 +130,13 @@ func (l *boltLog) TruncateBefore(index int) {
 		for k, _ := c.First(); k != nil && keyToU64(k) < uint64(index); k, _ = c.Next() {
 			_ = c.Delete()
 		}
-
+		meta := tx.Bucket([]byte("meta"))
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(index))
+		_ = meta.Put([]byte("firstIndex"), buf[:])
 		return nil
 	})
+	l.base = uint64(index)
 }
 
 func (l *boltLog) TruncateSuffix(idx int) error {
